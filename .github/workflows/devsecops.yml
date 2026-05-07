@@ -1,0 +1,211 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Re-scan hebdomadaire (les CVE évoluent même si le code ne bouge pas).
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write   # écriture dans Security › Code scanning (upload-sarif)
+  actions: read            # lecture des métadonnées du run (fingerprints SARIF)
+
+jobs:
+  # ----------------------------------------------------------------------
+  # 1. Démarre la stack pour vérifier qu'elle fonctionne
+  # ----------------------------------------------------------------------
+  deploy-stack:
+    name: Déploiement de la stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Préparer le .env
+        working-directory: docker
+        run: cp .env.example .env
+
+      - name: Démarrer la stack
+        working-directory: docker
+        run: docker compose up -d
+
+      - name: Attendre que WordPress réponde
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8080 > /dev/null; then
+              echo "WordPress UP"; exit 0
+            fi
+            echo "tentative $i..."; sleep 5
+          done
+          docker compose -f docker/docker-compose.yml logs --tail=100
+          exit 1
+
+      - name: Vérifier Prometheus / Grafana
+        run: |
+          curl -fsS http://localhost:9090/-/ready
+          curl -fsS http://localhost:3000/api/health
+
+      - name: État des conteneurs
+        if: always()
+        run: docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+      - name: Stopper la stack
+        if: always()
+        working-directory: docker
+        run: docker compose down -v
+
+  # ----------------------------------------------------------------------
+  # 2. Scan Trivy sur toutes les images de la stack (en parallèle)
+  # ----------------------------------------------------------------------
+  trivy-scan:
+    name: Scan Trivy (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: "wordpress:6.5-php8.2-apache"
+            slug: "wordpress"
+          - image: "mariadb:10.11"
+            slug: "mariadb"
+          - image: "prom/prometheus:v2.54.1"
+            slug: "prometheus"
+          - image: "grafana/grafana:11.2.0"
+            slug: "grafana"
+          - image: "prom/node-exporter:v1.8.2"
+            slug: "node-exporter"
+          - image: "gcr.io/cadvisor/cadvisor:v0.49.1"
+            slug: "cadvisor"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy - rapport JSON
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          format: json
+          output: trivy-${{ matrix.slug }}.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          ignore-unfixed: false
+          vuln-type: "os,library"
+
+      - name: Trivy - rapport SARIF (pour GitHub Security)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          format: sarif
+          output: trivy-${{ matrix.slug }}.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          vuln-type: "os,library"
+
+      - name: Upload SARIF -> GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-${{ matrix.slug }}.sarif
+          category: trivy-${{ matrix.slug }}
+
+      - name: Conserver les rapports JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-json-${{ matrix.slug }}
+          path: trivy-${{ matrix.slug }}.json
+          retention-days: 14
+
+  # ----------------------------------------------------------------------
+  # 3. Rapport Trivy agrégé (Markdown + HTML) via notre script Python
+  # ----------------------------------------------------------------------
+  trivy-report:
+    name: Rapport Trivy agrégé
+    needs: trivy-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Récupérer tous les JSON Trivy
+        uses: actions/download-artifact@v4
+        with:
+          path: trivy-raw
+          pattern: trivy-json-*
+          merge-multiple: true
+
+      - name: Générer le rapport
+        run: |
+          mkdir -p reports
+          python scripts/trivy_report.py \
+            --input trivy-raw \
+            --out-md reports/trivy-report.md \
+            --out-html reports/trivy-report.html \
+            --fail-on NONE
+
+      - name: Injecter le résumé dans la page du run
+        run: cat reports/trivy-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload du rapport HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-html
+          path: |
+            reports/trivy-report.html
+            reports/trivy-report.md
+          retention-days: 30
+
+  # ----------------------------------------------------------------------
+  # 4. Scan Bandit du code Python (script trivy_report.py)
+  # ----------------------------------------------------------------------
+  bandit:
+    name: Scan Bandit (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer Bandit
+        run: pip install -r scripts/requirements.txt
+
+      - name: Bandit - JSON + texte
+        run: |
+          mkdir -p reports
+          bandit -r scripts -f json -o reports/bandit-report.json || true
+          bandit -r scripts -f txt  -o reports/bandit-report.txt  || true
+
+      - name: Bandit - SARIF (pour GitHub Security)
+        run: |
+          pip install bandit-sarif-formatter
+          bandit -r scripts -f sarif -o reports/bandit-report.sarif || true
+
+      - name: Upload SARIF -> GitHub Code Scanning
+        if: hashFiles('reports/bandit-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/bandit-report.sarif
+          category: bandit
+
+      - name: Résumé Bandit dans la page du run
+        if: always()
+        run: |
+          echo "## Rapport Bandit (analyse statique Python)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 60 reports/bandit-report.txt >> "$GITHUB_STEP_SUMMARY" || echo "rapport indisponible" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload des rapports Bandit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-reports
+          path: |
+            reports/bandit-report.json
+            reports/bandit-report.txt
+            reports/bandit-report.sarif
+          retention-days: 30

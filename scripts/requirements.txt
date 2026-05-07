@@ -1,0 +1,3 @@
+# Le script trivy_report.py n'utilise que la stdlib.
+# On installe ici uniquement les outils d'analyse statique de la pipeline.
+bandit[toml]==1.7.9

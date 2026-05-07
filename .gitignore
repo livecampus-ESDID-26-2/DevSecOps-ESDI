@@ -1,0 +1,28 @@
+# Secrets / config locale
+.env
+docker/.env
+
+# Rapports générés (à la racine, hors dossier reports/)
+/trivy-*.json
+/trivy-*.sarif
+/trivy-report.html
+/trivy-report.md
+/bandit-report.*
+/trivy-raw/
+
+# Dossier reports/ : on garde le dossier dans le repo (via .gitkeep),
+# mais aucun rapport généré n'est versionné. Tout est régénéré en CI
+# (artefacts) ou en local (cf. README.md).
+reports/*
+!reports/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / éditeurs
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,6 @@
+# Liste des CVE volontairement ignorées (avec justification + date de revue).
+# Format : un identifiant CVE par ligne, commentaire au-dessus.
+#
+# Exemple :
+# # CVE-2024-XXXXX : faux positif, paquet non utilisé. Revue : 2026-05-01
+# CVE-2024-XXXXX
